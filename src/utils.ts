@@ -1,21 +1,32 @@
 import * as vscode from 'vscode';
-import { TIME_BETWEEN_HEARTBEATS_MS } from './constants';
+import { COMMON_AI_EXTENSIONS, TIME_BETWEEN_HEARTBEATS_MS } from './constants';
 
 export class Utils {
-  private static appNames = {
+  private static appNames: { [key: string]: string } = {
     'Arduino IDE': 'arduino',
     'Azure Data Studio': 'azdata',
     Cursor: 'cursor',
+    Kiro: 'kiro',
     Onivim: 'onivim',
     'Onivim 2': 'onivim',
+    Qoder: 'qoder',
     'SQL Operations Studio': 'sqlops',
     Trae: 'trae',
-    'Visual Studio Code': 'vscode',
     Windsurf: 'windsurf',
   };
 
+  private static editorNameFromHint(hint?: string): string | undefined {
+    const normalized = hint?.replace(/\s/g, '').toLowerCase();
+    if (!normalized) return undefined;
+
+    for (const editor of Object.keys(this.appNames)) {
+      const editorKey = editor.replace(/\s/g, '').toLowerCase();
+      if (normalized.includes(editorKey)) return this.appNames[editor];
+    }
+  }
+
   public static quote(str: string): string {
-    if (str.includes(' ')) return `"${str.replace('"', '\\"')}"`;
+    if (str.includes(' ')) return `"${str.replace(/"/g, '\\"')}"`;
     return str;
   }
 
@@ -137,6 +148,16 @@ export class Utils {
     return uri.scheme === 'pr';
   }
 
+  public static isCodexCodeReview(e: vscode.TabChangeEvent): boolean {
+    const isCodexDiff = (tab: vscode.Tab): boolean => {
+      if (!tab.isActive) return false;
+      const viewType = (tab.input as { viewType?: string } | undefined)?.viewType;
+      if (!viewType?.includes('chatgpt')) return false;
+      return tab.label.toLowerCase().includes('codex diff');
+    };
+    return [...e.opened, ...e.changed].some(isCodexDiff);
+  }
+
   public static isAIChatSidebar(uri: vscode.Uri | undefined): boolean {
     // first check if the active tab is the Claude Code sidebar
     const activeTab = vscode.window.tabGroups?.activeTabGroup?.activeTab;
@@ -188,61 +209,42 @@ export class Utils {
     return false;
   }
 
-  public static getEditorName(): string {
-    if (this.appNames[vscode.env.appName]) {
-      return this.appNames[vscode.env.appName];
-    } else if (vscode.env.appName.toLowerCase().includes('visual')) {
+  public static getEditorName(env: typeof vscode.env = vscode.env): string {
+    const editor = this.editorNameFromHint(env.uriScheme) || this.editorNameFromHint(env.appRoot);
+    if (editor) return editor;
+
+    if (this.appNames[env.appName]) return this.appNames[env.appName];
+
+    if (env.appName.toLowerCase().includes('visual')) {
       return 'vscode';
     } else {
-      return vscode.env.appName.replace(/\s/g, '').toLowerCase();
+      return env.appName.replace(/\s/g, '').toLowerCase();
     }
   }
 
-  public static isAICapableEditor(): boolean {
-    const editorName = vscode.env.appName.toLowerCase();
-    return editorName.includes('cursor') || editorName.includes('windsurf');
-  }
-
   public static hasAIExtensions(): boolean {
-    const commonAIExtensions = [
-      'anthropic.claude-code',
-      'codeium.codeium',
-      'continue.continue',
-      'github.copilot-chat',
-      'github.copilot',
-      'ms-vscode.vscode-ai-toolkit',
-      'openai.openai-gpt-vscode',
-      'openai.chatgpt',
-      'sourcegraph.cody-ai',
-      'supermaven.supermaven',
-      'tabnine.tabnine-vscode',
-    ];
-
-    return commonAIExtensions.some((extensionId) => {
-      const extension = vscode.extensions.getExtension(extensionId);
-      return extension && extension.isActive;
+    return COMMON_AI_EXTENSIONS.some((assistant) => {
+      return assistant.extensionIds.some((id) => {
+        const extension = vscode.extensions.getExtension(id);
+        return extension && extension.isActive;
+      });
     });
   }
 
-  public static checkAICapabilities(): boolean {
-    return this.isAICapableEditor() || this.hasAIExtensions();
+  public static buildUserAgentString(
+    editorName: string,
+    extensionVersion: string,
+    aiName: string | undefined = undefined,
+  ): string {
+    const ai = aiName ? ` ${aiName}` : '';
+    return editorName + '/' + vscode.version + ai + ' vscode-wakatime/' + extensionVersion;
   }
-}
 
-interface FileSelection {
-  selection: vscode.Position;
-  lastHeartbeatAt: number;
-}
-
-export interface FileSelectionMap {
-  [key: string]: FileSelection;
-}
-
-export interface Lines {
-  [fileName: string]: number;
-}
-
-export interface LineCounts {
-  ai: Lines;
-  human: Lines;
+  public static withinSeconds(
+    relativeTo: number,
+    compareTo: number,
+    withinSeconds: number,
+  ): boolean {
+    return Math.abs(relativeTo - compareTo) <= withinSeconds;
+  }
 }

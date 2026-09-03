@@ -1,26 +1,29 @@
 // import * as azdata from 'azdata';
 import * as child_process from 'child_process';
 import * as fs from 'fs';
-import * as path from 'path';
 import * as os from 'os';
+import * as path from 'path';
 import * as vscode from 'vscode';
 
 import {
   AI_RECENT_PASTES_TIME_MS,
+  ALLOWED_SCHEMES,
   COMMAND_DASHBOARD,
   Heartbeat,
   LogLevel,
   SEND_BUFFER_SECONDS,
+  SYNC_AI_HEARTBEATS_DEBOUNCE_SECONDS,
 } from './constants';
+import { FileSelectionMap, HumanTypingMap, LineCounts, LinesInFiles } from './types';
+import { Utils } from './utils';
 import { Options, Setting } from './options';
 
 import { Dependencies } from './dependencies';
 import { Desktop } from './desktop';
 import { Logger } from './logger';
-import { FileSelectionMap, LineCounts, Lines, Utils } from './utils';
 
 export class WakaTime {
-  private agentName: string;
+  private editorName: string;
   private extension: any;
   private statusBar?: vscode.StatusBarItem = undefined;
   private statusBarTeamYou?: vscode.StatusBarItem = undefined;
@@ -31,6 +34,7 @@ export class WakaTime {
   private lastDebug: boolean = false;
   private lastCompile: boolean = false;
   private lastAICodeGenerating: boolean = false;
+  private lastCodeReviewing: boolean = false;
   private dedupe: FileSelectionMap = {};
   private debounceId: any = null;
   private debounceMs = 50;
@@ -60,8 +64,10 @@ export class WakaTime {
   private isMetricsEnabled: boolean = false;
   private heartbeats: Heartbeat[] = [];
   private lastSent: number = 0;
-  private linesInFiles: Lines = {};
+  private linesInFiles: LinesInFiles = {};
   private lineChanges: LineCounts = { ai: {}, human: {} };
+  private syncAIHeartbeatsDebounce?: NodeJS.Timeout = undefined;
+  private filesWithHumanTyping: HumanTypingMap = {};
 
   constructor(extensionPath: string, logger: Logger) {
     this.extensionPath = extensionPath;
@@ -84,9 +90,9 @@ export class WakaTime {
 
         const extension = vscode.extensions.getExtension('WakaTime.vscode-wakatime');
         this.extension = (extension != undefined && extension.packageJSON) || { version: '0.0.0' };
-        this.agentName = Utils.getEditorName();
+        this.editorName = Utils.getEditorName();
 
-        this.hasAICapabilities = Utils.checkAICapabilities();
+        this.hasAICapabilities = Utils.hasAIExtensions();
 
         this.options.getSetting('settings', 'disabled', false, (disabled: Setting) => {
           this.disabled = disabled.value === 'true';
@@ -102,6 +108,10 @@ export class WakaTime {
   }
 
   public dispose() {
+    if (this.syncAIHeartbeatsDebounce) {
+      clearTimeout(this.syncAIHeartbeatsDebounce);
+      this.syncAIHeartbeatsDebounce = undefined;
+    }
     this.sendHeartbeats();
     this.statusBar?.dispose();
     this.statusBarTeamYou?.dispose();
@@ -430,13 +440,32 @@ export class WakaTime {
     // subscribe to selection change and editor activation events
     const subscriptions: vscode.Disposable[] = [];
     vscode.window.onDidChangeTextEditorSelection(this.onChangeSelection, this, subscriptions);
+    vscode.window.onDidChangeTextEditorVisibleRanges(
+      this.onDidChangeTextEditorVisibleRanges,
+      this,
+      subscriptions,
+    );
     vscode.workspace.onDidChangeTextDocument(this.onChangeTextDocument, this, subscriptions);
     vscode.window.onDidChangeActiveTextEditor(this.onChangeTab, this, subscriptions);
+    vscode.window.onDidChangeVisibleTextEditors(
+      this.onDidChangeVisibleTextEditors,
+      this,
+      subscriptions,
+    );
     vscode.window.tabGroups.onDidChangeTabs(this.onDidChangeTabs, this, subscriptions);
+    vscode.window.onDidChangeWindowState(this.onDidChangeWindowState, this, subscriptions);
     vscode.workspace.onDidSaveTextDocument(this.onSave, this, subscriptions);
 
     vscode.workspace.onDidChangeNotebookDocument(this.onChangeNotebook, this, subscriptions);
+    vscode.window.onDidChangeNotebookEditorSelection(
+      this.onDidChangeNotebookEditorSelection,
+      this,
+      subscriptions,
+    );
     vscode.workspace.onDidSaveNotebookDocument(this.onSaveNotebook, this, subscriptions);
+
+    vscode.window.onDidChangeActiveTerminal(this.onDidChangeActiveTerminal, this, subscriptions);
+    vscode.window.onDidOpenTerminal(this.onDidOpenTerminal, this, subscriptions);
 
     vscode.tasks.onDidStartTask(this.onDidStartTask, this, subscriptions);
     vscode.tasks.onDidEndTask(this.onDidEndTask, this, subscriptions);
@@ -445,6 +474,7 @@ export class WakaTime {
     vscode.debug.onDidChangeBreakpoints(this.onDebuggingChanged, this, subscriptions);
     vscode.debug.onDidStartDebugSession(this.onDidStartDebugSession, this, subscriptions);
     vscode.debug.onDidTerminateDebugSession(this.onDidTerminateDebugSession, this, subscriptions);
+    vscode.lm.onDidChangeChatModels(this.onDidChangeChatModels, this, subscriptions);
 
     // create a combined disposable for all event subscriptions
     this.disposable = vscode.Disposable.from(...subscriptions);
@@ -452,12 +482,14 @@ export class WakaTime {
 
   private onDebuggingChanged(): void {
     this.logger.debug('onDebuggingChanged');
+    this.syncAIHeartbeatsDebounced();
     this.updateLineNumbers();
     this.onEvent(false);
   }
 
   private onDidStartDebugSession(): void {
     this.logger.debug('onDidStartDebugSession');
+    this.syncAIHeartbeatsDebounced();
     this.isDebugging = true;
     this.isAICodeGenerating = false;
     this.updateLineNumbers();
@@ -466,13 +498,15 @@ export class WakaTime {
 
   private onDidTerminateDebugSession(): void {
     this.logger.debug('onDidTerminateDebugSession');
+    this.syncAIHeartbeatsDebounced();
     this.isDebugging = false;
     this.updateLineNumbers();
     this.onEvent(false);
   }
 
   private onDidStartTask(e: vscode.TaskStartEvent): void {
-    this.logger.debug('onDidTerminateDebugSession');
+    this.logger.debug('onDidStartTask');
+    this.syncAIHeartbeatsDebounced();
     if (e.execution.task.isBackground) return;
     if (e.execution.task.detail && e.execution.task.detail.indexOf('watch') !== -1) return;
     this.isCompiling = true;
@@ -483,14 +517,17 @@ export class WakaTime {
 
   private onDidEndTask(): void {
     this.logger.debug('onDidEndTask');
+    this.syncAIHeartbeatsDebounced();
     this.isCompiling = false;
     this.updateLineNumbers();
     this.onEvent(false);
   }
 
   private onChangeSelection(e: vscode.TextEditorSelectionChangeEvent): void {
-    this.logger.debug('onChangeSelection');
+    this.syncAIHeartbeatsDebounced();
+    if (!ALLOWED_SCHEMES.includes(e.textEditor?.document?.uri?.scheme)) return;
     if (e.kind === vscode.TextEditorSelectionChangeKind.Command) return;
+    this.logger.debug('onChangeSelection');
     if (Utils.isAIChatSidebar(e.textEditor?.document?.uri)) {
       this.isAICodeGenerating = true;
     }
@@ -499,7 +536,17 @@ export class WakaTime {
   }
 
   private onChangeTextDocument(e: vscode.TextDocumentChangeEvent): void {
+    this.syncAIHeartbeatsDebounced();
+    if (!ALLOWED_SCHEMES.includes(e.document?.uri?.scheme)) return;
     this.logger.debug('onChangeTextDocument');
+
+    if (e.contentChanges.find((v) => v.text.length === 1)) {
+      const file = Utils.getFocusedFile(e.document);
+      if (file) {
+        this.filesWithHumanTyping[file] = true;
+      }
+    }
+
     if (Utils.isAIChatSidebar(e.document?.uri)) {
       this.isAICodeGenerating = true;
       this.AIdebounceCount = 0;
@@ -532,22 +579,87 @@ export class WakaTime {
     this.onEvent(false);
   }
 
-  private onChangeTab(_e: vscode.TextEditor | undefined): void {
+  private onChangeTab(e: vscode.TextEditor | undefined): void {
+    this.syncAIHeartbeatsDebounced();
+    if (!ALLOWED_SCHEMES.includes(e?.document?.uri?.scheme ?? '')) return;
     this.logger.debug('onChangeTab');
     this.isAICodeGenerating = false;
     this.updateLineNumbers();
     this.onEvent(false);
   }
 
-  private onDidChangeTabs(_e: vscode.TabChangeEvent): void {
+  private onDidChangeTabs(e: vscode.TabChangeEvent): void {
     this.logger.debug('onDidChangeTabs');
+    this.syncAIHeartbeatsDebounced();
+    if (Utils.isCodexCodeReview(e)) {
+      this.appendCodeReviewHeartbeat();
+      return;
+    }
     if (!this.isAICodeGenerating) return;
     this.updateLineNumbers();
     this.onEvent(false);
   }
 
-  private onSave(_e: vscode.TextDocument | undefined): void {
+  private async appendCodeReviewHeartbeat(): Promise<void> {
+    if (this.disabled) return;
+    if (!this.dependencies.isCliInstalled()) return;
+
+    const time = Date.now();
+    if (this.lastCodeReviewing && !Utils.enoughTimePassed(this.lastHeartbeat, time)) return;
+
+    const editor = vscode.window.activeTextEditor;
+    const doc = editor?.document;
+    const file = doc ? Utils.getFocusedFile(doc) : undefined;
+    const entity = file ?? 'Codex Diff';
+
+    const heartbeat: Heartbeat = {
+      entity,
+      time: time / 1000,
+      is_write: false,
+      category: 'code reviewing',
+    };
+
+    if (doc) {
+      heartbeat.lines_in_file = doc.lineCount;
+      if (editor) {
+        heartbeat.lineno = editor.selection.start.line + 1;
+        heartbeat.cursorpos = editor.selection.start.character + 1;
+      }
+      const project = this.getProjectName(doc.uri);
+      if (project) heartbeat.alternate_project = project;
+      const folder = this.getProjectFolder(doc.uri);
+      if (folder) heartbeat.project_folder = folder;
+      if (doc.isUntitled) heartbeat.is_unsaved_entity = true;
+    } else {
+      heartbeat.entity_type = 'app';
+      const wsf = vscode.workspace.workspaceFolders?.[0];
+      if (wsf) {
+        heartbeat.alternate_project = wsf.name;
+        heartbeat.project_folder = wsf.uri.fsPath;
+      }
+    }
+
+    this.lastFile = entity;
+    this.lastHeartbeat = time;
+    this.lastCodeReviewing = true;
+
+    this.logger.debug(
+      `Appending code-reviewing heartbeat to local buffer: ${JSON.stringify(heartbeat, null, 2)}`,
+    );
+    this.heartbeats.push(heartbeat);
+
+    await this.sendHeartbeatsIfNecessary();
+  }
+
+  private onSave(e: vscode.TextDocument | undefined): void {
     this.logger.debug('onSave');
+
+    const file = Utils.getFocusedFile(e);
+    if (file) {
+      this.filesWithHumanTyping[file] = true;
+    }
+
+    this.syncAIHeartbeatsDebounced();
     this.isAICodeGenerating = false;
     this.updateLineNumbers();
     this.onEvent(true);
@@ -555,14 +667,52 @@ export class WakaTime {
 
   private onChangeNotebook(_e: vscode.NotebookDocumentChangeEvent): void {
     this.logger.debug('onChangeNotebook');
+    this.syncAIHeartbeatsDebounced();
     this.updateLineNumbers();
     this.onEvent(false);
   }
 
   private onSaveNotebook(_e: vscode.NotebookDocument | undefined): void {
     this.logger.debug('onSaveNotebook');
+    this.syncAIHeartbeatsDebounced();
     this.updateLineNumbers();
     this.onEvent(true);
+  }
+
+  private onDidChangeTextEditorVisibleRanges(_e: vscode.TextEditorVisibleRangesChangeEvent): void {
+    this.logger.debug('onDidChangeTextEditorVisibleRanges');
+    this.syncAIHeartbeatsDebounced();
+  }
+
+  private onDidChangeVisibleTextEditors(_e: readonly vscode.TextEditor[]): void {
+    this.logger.debug('onDidChangeVisibleTextEditors');
+    this.syncAIHeartbeatsDebounced();
+  }
+
+  private onDidChangeWindowState(e: vscode.WindowState): void {
+    if (!e.focused) return;
+    this.logger.debug('onDidChangeWindowState');
+    this.syncAIHeartbeatsDebounced();
+  }
+
+  private onDidChangeNotebookEditorSelection(_e: vscode.NotebookEditorSelectionChangeEvent): void {
+    this.logger.debug('onDidChangeNotebookEditorSelection');
+    this.syncAIHeartbeatsDebounced();
+  }
+
+  private onDidChangeActiveTerminal(_e: vscode.Terminal | undefined): void {
+    this.logger.debug('onDidChangeActiveTerminal');
+    this.syncAIHeartbeatsDebounced();
+  }
+
+  private onDidOpenTerminal(_e: vscode.Terminal): void {
+    this.logger.debug('onDidOpenTerminal');
+    this.syncAIHeartbeatsDebounced();
+  }
+
+  private onDidChangeChatModels(): void {
+    this.logger.debug('onDidChangeChatModels');
+    this.syncAIHeartbeatsDebounced();
   }
 
   private updateLineNumbers(): void {
@@ -571,24 +721,28 @@ export class WakaTime {
     const file = Utils.getFocusedFile(doc);
     if (!file) return;
 
+    const now = Date.now();
     const current = doc.lineCount;
     if (this.linesInFiles[file] === undefined) {
-      this.linesInFiles[file] = current;
+      this.linesInFiles[file] = { lines: current, updatedAt: now };
     }
 
-    const prev = this.linesInFiles[file] ?? current;
-    const delta = current - prev;
+    const prev = this.linesInFiles[file] ?? { lines: current, updatedAt: now };
+    let delta = current - prev.lines;
+
+    // prevent counting large copy/paste as human typed lines of code
+    if (delta > 50 && Math.abs(now - prev.updatedAt) < 60000) {
+      delta = 0;
+    }
 
     const changes = this.isAICodeGenerating ? this.lineChanges.ai : this.lineChanges.human;
     changes[file] = (changes[file] ?? 0) + delta;
 
-    this.linesInFiles[file] = current;
+    this.linesInFiles[file] = { lines: current, updatedAt: now };
   }
 
   private onEvent(isWrite: boolean): void {
-    if (Date.now() - this.lastSent > SEND_BUFFER_SECONDS * 1000) {
-      this.sendHeartbeats();
-    }
+    this.sendHeartbeatsIfNecessary();
 
     clearTimeout(this.debounceId);
     this.debounceId = setTimeout(() => {
@@ -665,6 +819,10 @@ export class WakaTime {
       human_line_changes: this.lineChanges.human[file],
     };
 
+    // Remove human line changes if we never detected human typing
+    if (!this.filesWithHumanTyping[file]) heartbeat.human_line_changes = 0;
+    this.filesWithHumanTyping[file] = false;
+
     this.lineChanges = { ai: {}, human: {} };
 
     if (isDebugging) {
@@ -676,6 +834,7 @@ export class WakaTime {
     } else if (Utils.isPullRequest(doc.uri)) {
       heartbeat.category = 'code reviewing';
     }
+    this.lastCodeReviewing = heartbeat.category === 'code reviewing';
 
     const project = this.getProjectName(doc.uri);
     if (project) heartbeat.alternate_project = project;
@@ -704,7 +863,11 @@ export class WakaTime {
     this.logger.debug(`Appending heartbeat to local buffer: ${JSON.stringify(heartbeat, null, 2)}`);
     this.heartbeats.push(heartbeat);
 
-    if (now - this.lastSent > SEND_BUFFER_SECONDS * 1000) {
+    await this.sendHeartbeatsIfNecessary();
+  }
+
+  private async sendHeartbeatsIfNecessary() {
+    if (Date.now() - this.lastSent > SEND_BUFFER_SECONDS * 1000) {
       await this.sendHeartbeats();
     }
   }
@@ -715,6 +878,71 @@ export class WakaTime {
       await this._sendHeartbeats();
     } else {
       await this.promptForApiKey();
+    }
+  }
+
+  private syncAIHeartbeatsDebounced(): void {
+    if (this.disabled) return;
+    if (this.syncAIHeartbeatsDebounce) clearTimeout(this.syncAIHeartbeatsDebounce);
+
+    this.syncAIHeartbeatsDebounce = setTimeout(() => {
+      this.syncAIHeartbeatsDebounce = undefined;
+      this.syncAIHeartbeats();
+    }, SYNC_AI_HEARTBEATS_DEBOUNCE_SECONDS * 1000);
+  }
+
+  private async syncAIHeartbeats(): Promise<void> {
+    if (!this.dependencies.isCliInstalled()) return;
+
+    const user_agent =
+      this.editorName + '/' + vscode.version + ' vscode-wakatime/' + this.extension.version;
+    const args = ['--sync-ai-activity', '--plugin', Utils.quote(user_agent)];
+
+    if (this.isMetricsEnabled) args.push('--metrics');
+
+    const doc = vscode.window.activeTextEditor?.document;
+    if (doc) {
+      const project = this.getProjectName(doc.uri);
+      if (project) {
+        args.push('--alternate-project');
+        args.push(project);
+      }
+      const folder = this.getProjectFolder(doc.uri);
+      if (folder) {
+        args.push('--project-folder');
+        args.push(folder);
+      }
+    }
+
+    const apiKey = await this.options.getApiKey();
+    if (!Utils.apiKeyInvalid(apiKey)) args.push('--key', Utils.quote(apiKey));
+
+    const apiUrl = await this.options.getApiUrl();
+    if (apiUrl) args.push('--api-url', Utils.quote(apiUrl));
+
+    if (Desktop.isWindows() || Desktop.isPortable()) {
+      args.push(
+        '--config',
+        Utils.quote(this.options.getConfigFile(false)),
+        '--log-file',
+        Utils.quote(this.options.getLogFile()),
+      );
+    }
+
+    const binary = this.dependencies.getCliLocation();
+    this.logger.debug(`Syncing AI heartbeats: ${Utils.formatArguments(binary, args)}`);
+    const options = Desktop.buildOptions();
+
+    try {
+      child_process.execFile(binary, args, options, (error, stdout, stderr) => {
+        if (error != null) {
+          if (stderr && stderr.toString() != '') this.logger.debug(stderr.toString());
+          if (stdout && stdout.toString() != '') this.logger.debug(stdout.toString());
+          this.logger.debug(error.toString());
+        }
+      });
+    } catch (e) {
+      this.logger.debugException(e);
     }
   }
 
@@ -730,15 +958,26 @@ export class WakaTime {
 
     args.push('--entity', Utils.quote(heartbeat.entity));
 
+    if (heartbeat.entity_type) {
+      args.push('--entity-type', heartbeat.entity_type);
+    }
+
     args.push('--time', String(heartbeat.time));
 
-    const user_agent =
-      this.agentName + '/' + vscode.version + ' vscode-wakatime/' + this.extension.version;
-    args.push('--plugin', Utils.quote(user_agent));
+    if (heartbeat.plugin) {
+      args.push('--plugin', Utils.quote(heartbeat.plugin));
+    } else {
+      args.push(
+        '--plugin',
+        Utils.quote(
+          Utils.buildUserAgentString(this.editorName, this.extension.version, heartbeat.agent),
+        ),
+      );
+    }
 
-    args.push('--lineno', String(heartbeat.lineno));
-    args.push('--cursorpos', String(heartbeat.cursorpos));
-    args.push('--lines-in-file', String(heartbeat.lines_in_file));
+    if (heartbeat.lineno) args.push('--lineno', String(heartbeat.lineno));
+    if (heartbeat.cursorpos) args.push('--cursorpos', String(heartbeat.cursorpos));
+    if (heartbeat.lines_in_file) args.push('--lines-in-file', String(heartbeat.lines_in_file));
     if (heartbeat.category) {
       args.push('--category', heartbeat.category);
     }
@@ -853,7 +1092,11 @@ export class WakaTime {
         this.logger.error(error_msg);
       }
 
-      cleanup.map((tmpfile) => fs.unlinkSync(tmpfile));
+      cleanup.map((tmpfile) => {
+        try {
+          fs.unlinkSync(tmpfile);
+        } catch (_) {}
+      });
     });
   }
 
@@ -884,7 +1127,7 @@ export class WakaTime {
     if (!this.dependencies.isCliInstalled()) return;
 
     const user_agent =
-      this.agentName + '/' + vscode.version + ' vscode-wakatime/' + this.extension.version;
+      this.editorName + '/' + vscode.version + ' vscode-wakatime/' + this.extension.version;
     const args = ['--today', '--output', 'json', '--plugin', Utils.quote(user_agent)];
 
     if (this.isMetricsEnabled) args.push('--metrics');
@@ -998,7 +1241,7 @@ export class WakaTime {
     }
 
     const user_agent =
-      this.agentName + '/' + vscode.version + ' vscode-wakatime/' + this.extension.version;
+      this.editorName + '/' + vscode.version + ' vscode-wakatime/' + this.extension.version;
     const args = ['--output', 'json', '--plugin', Utils.quote(user_agent)];
 
     args.push('--file-experts', Utils.quote(file));
@@ -1118,11 +1361,11 @@ export class WakaTime {
 
   private isDuplicateHeartbeat(file: string, time: number, selection: vscode.Position): boolean {
     let duplicate = false;
-    const minutes = 30;
+    const minutes = 10;
     const milliseconds = minutes * 60000;
     if (
       this.dedupe[file] &&
-      this.dedupe[file].lastHeartbeatAt + milliseconds < time &&
+      this.dedupe[file].lastHeartbeatAt + milliseconds > time &&
       this.dedupe[file].selection.line == selection.line &&
       this.dedupe[file].selection.character == selection.character
     ) {

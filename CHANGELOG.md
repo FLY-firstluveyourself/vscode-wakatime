@@ -1,6 +1,144 @@
 
 # Changelog
 
+## 30.2.1 (2026-06-12)
+
+- Fix detecting Cursor IDE name.
+  [#483](https://github.com/wakatime/vscode-wakatime/issues/483)
+
+## 30.2.0 (2026-05-15)
+
+- Track when code reviewing Codex diffst
+
+## 30.1.3 (2026-05-01)
+
+- Prevent attributing AI lines to Human by guarding for single character typing.
+
+## 30.1.2 (2026-04-27)
+
+- Remove redundant vsocde editor name.
+
+## 30.1.1 (2026-04-27)
+
+- Improve IDE name detection.
+
+## 30.1.0 (2026-04-27)
+
+- Add Qoder app name.
+
+## 30.0.8 (2026-04-14)
+
+- Increase debounce time for syncing AI heartbeats to 60 seconds.
+
+## 30.0.7 (2026-04-14)
+
+- Add missing plugin argument when syncing AI heartbeats.
+
+## 30.0.6 (2026-04-12)
+
+- Fix sync ai heartbeats param name.
+  [#1327](https://github.com/wakatime/wakatime-cli/issues/1327)
+
+## 30.0.5 (2026-04-05)
+
+- Correctly count human deletes of many lines.
+
+## 30.0.4 (2026-04-02)
+
+- Prevent counting large paste as human typed lines of code.
+
+## 30.0.3 (2026-04-02)
+
+- Make sure we sync AI heartbeats when there is no human coding.
+
+## 30.0.2 (2026-03-31)
+
+- Enable parsing AI transcripts.
+
+## 30.0.1 (2026-03-30)
+
+- Disable parsing AI transcripts.
+
+## 30.0.0 (2026-03-28)
+
+- Sync AI activity using wakatime-cli.
+
+## 29.0.3 (2026-03-16)
+
+- Disable parsing Cursor transcript logs because of performance impact.
+  [#479](https://github.com/wakatime/vscode-wakatime/issues/479)
+
+## 29.0.2 (2026-03-15)
+
+- Support both diff and plain Cursor edit_file_v2.
+  [#474](https://github.com/wakatime/vscode-wakatime/issues/474)
+
+## 29.0.1 (2026-03-15)
+
+- Include sql.js with published extension from node_modules folder.
+  [#474](https://github.com/wakatime/vscode-wakatime/issues/474)
+
+## 29.0.0 (2026-03-15)
+
+- Bundle sql.js with extension for parsing Cursor transcript logs.
+  [#474](https://github.com/wakatime/vscode-wakatime/issues/474)
+
+## 28.0.4 (2026-03-15)
+
+- Allow remote schemes.
+  [#477](https://github.com/wakatime/vscode-wakatime/issues/477)
+
+## 28.0.3 (2026-03-15)
+
+- Fix onChangeSelection allowed schemes.
+  [#477](https://github.com/wakatime/vscode-wakatime/issues/477)
+
+## 28.0.2 (2026-03-11)
+
+- Only update last read time when heartbeats found for Cursor.
+
+## 28.0.1 (2026-03-11)
+
+- Prevent tracking AI changes from Cursor in the past.
+
+## 28.0.0 (2026-03-11)
+
+- Support Cursor IDE by parsing transcript vscdb sqlite3 files.
+
+## 27.0.0 (2026-03-08)
+
+- Support Cursor IDE by parsing project transcript jsonl files.
+
+## 26.0.5 (2026-03-08)
+
+- Skip human heartbeats when any AI activity detected.
+  [#474](https://github.com/wakatime/vscode-wakatime/issues/474)
+
+## 26.0.4 (2026-03-08)
+
+- Respect WakaTime Claude Code cli plugin state file to prevent duplicate stats.
+  [#474](https://github.com/wakatime/vscode-wakatime/issues/474)
+
+## 26.0.3 (2026-03-08)
+
+- Fix AI time tracking for Claude Code.
+  [#474](https://github.com/wakatime/vscode-wakatime/issues/474)
+
+## 26.0.2 (2026-03-08)
+
+- Fix AI time tracking for Codex.
+  [#474](https://github.com/wakatime/vscode-wakatime/issues/474)
+
+## 26.0.1 (2026-03-08)
+
+- Rewrite buffered heartbeats to AI category when transcript logs contain matching entity file paths.
+  [#474](https://github.com/wakatime/vscode-wakatime/issues/474)
+
+## 26.0.0 (2026-03-04)
+
+- Detect AI coding from Codex and Claude transcript logs.
+  [#474](https://github.com/wakatime/vscode-wakatime/issues/474)
+
 ## 25.5.1 (2025-12-14)
 
 - Prevent long running terminal command from triggering heartbeats.

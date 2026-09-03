@@ -10,7 +10,8 @@ import {
 
 import { Logger } from './logger';
 import { Memento } from 'vscode';
-import { FileSelectionMap, LineCounts, Lines, Utils } from '../utils';
+import { FileSelectionMap, HumanTypingMap, LineCounts, LinesInFiles } from '../types';
+import { Utils } from '../utils';
 
 export class WakaTime {
   private agentName: string;
@@ -24,6 +25,7 @@ export class WakaTime {
   private lastDebug: boolean = false;
   private lastCompile: boolean = false;
   private lastAICodeGenerating: boolean = false;
+  private lastCodeReviewing: boolean = false;
   private dedupe: FileSelectionMap = {};
   private debounceId: any = null;
   private debounceMs = 50;
@@ -49,8 +51,9 @@ export class WakaTime {
   private lastApiKeyPrompted: number = 0;
   private heartbeats: Heartbeat[] = [];
   private lastSent: number = 0;
-  private linesInFiles: Lines = {};
+  private linesInFiles: LinesInFiles = {};
   private lineChanges: LineCounts = { ai: {}, human: {} };
+  private filesWithHumanTyping: HumanTypingMap = {};
 
   constructor(logger: Logger, config: Memento) {
     this.logger = logger;
@@ -66,7 +69,7 @@ export class WakaTime {
     this.extension = (extension != undefined && extension.packageJSON) || { version: '0.0.0' };
     this.agentName = Utils.getEditorName();
 
-    this.hasAICapabilities = Utils.checkAICapabilities();
+    this.hasAICapabilities = Utils.hasAIExtensions();
 
     this.disabled = this.config.get('wakatime.disabled') === 'true';
     if (this.disabled) {
@@ -427,6 +430,14 @@ export class WakaTime {
 
   private onChangeTextDocument(e: vscode.TextDocumentChangeEvent): void {
     this.logger.debug('onChangeTextDocument');
+
+    if (e.contentChanges.find((v) => v.text.length === 1)) {
+      const file = Utils.getFocusedFile(e.document);
+      if (file) {
+        this.filesWithHumanTyping[file] = true;
+      }
+    }
+
     if (Utils.isAIChatSidebar(e.document?.uri)) {
       this.isAICodeGenerating = true;
       this.AIdebounceCount = 0;
@@ -464,15 +475,79 @@ export class WakaTime {
     this.onEvent(false);
   }
 
-  private onDidChangeTabs(_e: vscode.TabChangeEvent): void {
+  private onDidChangeTabs(e: vscode.TabChangeEvent): void {
     this.logger.debug('onDidChangeTabs');
+    if (Utils.isCodexCodeReview(e)) {
+      this.appendCodeReviewHeartbeat();
+      return;
+    }
     if (!this.isAICodeGenerating) return;
     this.updateLineNumbers();
     this.onEvent(false);
   }
 
-  private onSave(_e: vscode.TextDocument | undefined): void {
+  private async appendCodeReviewHeartbeat(): Promise<void> {
+    if (this.disabled) return;
+
+    const time = Date.now();
+    if (this.lastCodeReviewing && !Utils.enoughTimePassed(this.lastHeartbeat, time)) return;
+
+    const editor = vscode.window.activeTextEditor;
+    const doc = editor?.document;
+    const file = doc ? Utils.getFocusedFile(doc) : undefined;
+    const entity = file ?? 'Codex Diff';
+
+    const heartbeat: Heartbeat = {
+      entity,
+      time: time / 1000,
+      is_write: false,
+      category: 'code reviewing',
+    };
+
+    if (doc) {
+      heartbeat.lines_in_file = doc.lineCount;
+      if (editor) {
+        heartbeat.lineno = editor.selection.start.line + 1;
+        heartbeat.cursorpos = editor.selection.start.character + 1;
+      }
+      const language = this.getLanguage(doc);
+      if (language) heartbeat.language = language;
+      const folder = this.getProjectFolder(doc.uri);
+      if (folder && file && file.indexOf(folder) === 0) {
+        heartbeat.project_root_count = this.countSlashesInPath(folder);
+      }
+      if (doc.isUntitled) heartbeat.is_unsaved_entity = true;
+    } else {
+      heartbeat.entity_type = 'app';
+      const wsf = vscode.workspace.workspaceFolders?.[0];
+      if (wsf) heartbeat.project_folder = wsf.uri.fsPath;
+    }
+
+    const project = this.getProjectName();
+    if (project) heartbeat.alternate_project = project;
+
+    this.lastFile = entity;
+    this.lastHeartbeat = time;
+    this.lastCodeReviewing = true;
+
+    this.logger.debug(
+      `Appending code-reviewing heartbeat to local buffer: ${JSON.stringify(heartbeat, null, 2)}`,
+    );
+    this.heartbeats.push(heartbeat);
+
+    if (Date.now() - this.lastSent > SEND_BUFFER_SECONDS * 1000) {
+      await this.sendHeartbeats();
+    }
+  }
+
+  private onSave(e: vscode.TextDocument | undefined): void {
     this.logger.debug('onSave');
+
+    const file = Utils.getFocusedFile(e);
+    if (file) {
+      this.filesWithHumanTyping[file] = true;
+    }
+
     this.isAICodeGenerating = false;
     this.updateLineNumbers();
     this.onEvent(true);
@@ -496,18 +571,21 @@ export class WakaTime {
     const file = Utils.getFocusedFile(doc);
     if (!file) return;
 
+    const now = Date.now();
     const current = doc.lineCount;
     if (this.linesInFiles[file] === undefined) {
-      this.linesInFiles[file] = current;
+      this.linesInFiles[file] = { lines: current, updatedAt: now };
     }
 
-    const prev = this.linesInFiles[file] ?? current;
-    const delta = current - prev;
+    const prev = this.linesInFiles[file] ?? { lines: current, updatedAt: now };
+    let delta = current - prev.lines;
 
-    const changes = this.isAICodeGenerating ? this.lineChanges.ai : this.lineChanges.human;
-    changes[file] = (changes[file] ?? 0) + delta;
+    // prevent counting large copy/paste as human typed lines of code
+    if (delta > 50 && Math.abs(now - prev.updatedAt) < 60000) {
+      delta = 0;
+    }
 
-    this.linesInFiles[file] = current;
+    this.linesInFiles[file] = { lines: current, updatedAt: now };
   }
 
   private onEvent(isWrite: boolean): void {
@@ -585,6 +663,10 @@ export class WakaTime {
       lines_in_file: doc.lineCount,
     };
 
+    // Remove human line changes if we never detected human typing
+    if (!this.filesWithHumanTyping[file]) heartbeat.human_line_changes = 0;
+    this.filesWithHumanTyping[file] = false;
+
     this.lineChanges = { ai: {}, human: {} };
 
     if (isDebugging) {
@@ -596,6 +678,7 @@ export class WakaTime {
     } else if (Utils.isPullRequest(doc.uri)) {
       heartbeat.category = 'code reviewing';
     }
+    this.lastCodeReviewing = heartbeat.category === 'code reviewing';
 
     if (heartbeat.ai_line_changes) {
       heartbeat.ai_line_changes = this.lineChanges.ai[file];
@@ -643,10 +726,11 @@ export class WakaTime {
     const plugin = this.getPlugin();
     const payload = JSON.stringify(
       this.heartbeats.map((h) => {
+        const { entity_type, ...rest } = h;
         return {
-          type: 'file',
+          type: entity_type ?? 'file',
           plugin,
-          ...h,
+          ...rest,
         };
       }),
     );
